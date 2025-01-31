@@ -1,4 +1,4 @@
-# Copyright 2022 The Nerfstudio Team. All rights reserved.
+# Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,14 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Scheduler Classes"""
 
 from abc import abstractmethod
 from dataclasses import dataclass, field
-from typing import Type
+from typing import Literal, Optional, Tuple, Type
 
 import numpy as np
 from torch.optim import Optimizer, lr_scheduler
+
+try:
+    from torch.optim.lr_scheduler import LRScheduler
+except ImportError:
+    # Backwards compatibility for PyTorch 1.x
+    from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 
 from nerfstudio.configs.base_config import InstantiateConfig
 
@@ -29,20 +36,20 @@ class SchedulerConfig(InstantiateConfig):
     """Basic scheduler config"""
 
     _target: Type = field(default_factory=lambda: Scheduler)
-    """_target: target class to instantiate"""
+    """target class to instantiate"""
 
 
-class Scheduler:  # pylint: disable=too-few-public-methods
-    """Exponential learning rate decay function."""
+class Scheduler:
+    """Base scheduler"""
 
     config: SchedulerConfig
 
-    def __init__(self, config: SchedulerConfig):
+    def __init__(self, config: SchedulerConfig) -> None:
         super().__init__()
         self.config = config
 
     @abstractmethod
-    def get_scheduler(self, optimizer: Optimizer, lr_init: float) -> lr_scheduler._LRScheduler:
+    def get_scheduler(self, optimizer: Optimizer, lr_init: float) -> LRScheduler:
         """Abstract method that returns a scheduler object.
 
         Args:
@@ -54,43 +61,114 @@ class Scheduler:  # pylint: disable=too-few-public-methods
 
 
 @dataclass
-class ExponentialDecaySchedulerConfig(SchedulerConfig):
-    """Exponential learning rate decay config"""
+class MultiStepSchedulerConfig(SchedulerConfig):
+    """Config for multi step scheduler where lr decays by gamma every milestone"""
 
-    _target: Type = field(default_factory=lambda: ExponentialDecayScheduler)
-    lr_final: float = 0.000005
-    """The final learning rate."""
+    _target: Type = field(default_factory=lambda: MultiStepScheduler)
+    """target class to instantiate"""
     max_steps: int = 1000000
     """The maximum number of steps."""
-    lr_delay_steps: int = 0
-    """The number of steps to delay the learning rate."""
-    lr_delay_mult: float = 1.0
-    """The multiplier for the learning rate after the delay."""
+    gamma: float = 0.33
+    """The learning rate decay factor."""
+    milestones: Tuple[int, ...] = (500000, 750000, 900000)
+    """The milestone steps at which to decay the learning rate."""
 
 
-class ExponentialDecayScheduler(Scheduler):  # pylint: disable=too-few-public-methods
-    """Exponential learning rate decay function.
-    See https://github.com/google-research/google-research/blob/
-    fd2cea8cdd86b3ed2c640cbe5561707639e682f3/jaxnerf/nerf/utils.py#L360
-    for details.
+class MultiStepScheduler(Scheduler):
+    """Multi step scheduler where lr decays by gamma every milestone"""
+
+    config: MultiStepSchedulerConfig
+
+    def get_scheduler(self, optimizer: Optimizer, lr_init: float) -> LRScheduler:
+        scheduler = lr_scheduler.MultiStepLR(
+            optimizer=optimizer,
+            milestones=self.config.milestones,
+            gamma=self.config.gamma,
+        )
+        return scheduler
+
+
+@dataclass
+class ExponentialDecaySchedulerConfig(SchedulerConfig):
+    """Config for exponential decay scheduler with warmup"""
+
+    _target: Type = field(default_factory=lambda: ExponentialDecayScheduler)
+    """target class to instantiate"""
+    lr_pre_warmup: float = 1e-8
+    """Learning rate before warmup."""
+    lr_final: Optional[float] = None
+    """Final learning rate. If not provided, it will be set to the optimizers learning rate."""
+    warmup_steps: int = 0
+    """Number of warmup steps."""
+    max_steps: int = 100000
+    """The maximum number of steps."""
+    ramp: Literal["linear", "cosine"] = "cosine"
+    """The ramp function to use during the warmup."""
+
+
+class ExponentialDecayScheduler(Scheduler):
+    """Exponential decay scheduler with linear warmup. Scheduler first ramps up to `lr_init` in `warmup_steps`
+    steps, then exponentially decays to `lr_final` in `max_steps` steps.
     """
 
     config: ExponentialDecaySchedulerConfig
 
-    def get_scheduler(self, optimizer: Optimizer, lr_init: float) -> lr_scheduler._LRScheduler:
+    def get_scheduler(self, optimizer: Optimizer, lr_init: float) -> LRScheduler:
+        if self.config.lr_final is None:
+            lr_final = lr_init
+        else:
+            lr_final = self.config.lr_final
+
         def func(step):
-            if self.config.lr_delay_steps > 0:
-                delay_rate = self.config.lr_delay_mult + (1 - self.config.lr_delay_mult) * np.sin(
-                    0.5 * np.pi * np.clip(step / self.config.lr_delay_steps, 0, 1)
-                )
+            if step < self.config.warmup_steps:
+                if self.config.ramp == "cosine":
+                    lr = self.config.lr_pre_warmup + (lr_init - self.config.lr_pre_warmup) * np.sin(
+                        0.5 * np.pi * np.clip(step / self.config.warmup_steps, 0, 1)
+                    )
+                else:
+                    lr = (
+                        self.config.lr_pre_warmup
+                        + (lr_init - self.config.lr_pre_warmup) * step / self.config.warmup_steps
+                    )
             else:
-                delay_rate = 1.0
-            t = np.clip(step / self.config.max_steps, 0, 1)
-            log_lerp = np.exp(np.log(lr_init) * (1 - t) + np.log(self.config.lr_final) * t)
-            multiplier = (
-                log_lerp / lr_init
-            )  # divided by lr_init because the multiplier is with the initial learning rate
-            return delay_rate * multiplier
+                t = np.clip(
+                    (step - self.config.warmup_steps) / (self.config.max_steps - self.config.warmup_steps), 0, 1
+                )
+                lr = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
+            return lr / lr_init  # divided by lr_init because the multiplier is with the initial learning rate
+
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=func)
+        return scheduler
+
+
+@dataclass
+class CosineDecaySchedulerConfig(SchedulerConfig):
+    """Config for cosine decay schedule"""
+
+    _target: Type = field(default_factory=lambda: CosineDecayScheduler)
+    """target class to instantiate"""
+    warm_up_end: int = 5000
+    """Iteration number where warmp ends"""
+    learning_rate_alpha: float = 0.05
+    """Learning rate alpha value"""
+    max_steps: int = 300000
+    """The maximum number of steps."""
+
+
+class CosineDecayScheduler(Scheduler):
+    """Cosine decay scheduler with linear warmup"""
+
+    config: CosineDecaySchedulerConfig
+
+    def get_scheduler(self, optimizer: Optimizer, lr_init: float) -> LRScheduler:
+        def func(step):
+            if step < self.config.warm_up_end:
+                learning_factor = step / self.config.warm_up_end
+            else:
+                alpha = self.config.learning_rate_alpha
+                progress = (step - self.config.warm_up_end) / (self.config.max_steps - self.config.warm_up_end)
+                learning_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
+            return learning_factor
 
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=func)
         return scheduler
